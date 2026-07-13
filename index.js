@@ -252,22 +252,20 @@ export function postEmail(config = {}) {
         }
     })
 
+    // No `teardown` in the descriptor — deliberately. The engine calls
+    // a postprocessor's teardown in a `finally` at the END OF EVERY
+    // postprocess phase (once per cycle), which is right for plugins
+    // that acquire per-cycle resources in a matching setup() (post-pdf's
+    // Puppeteer browser). This plugin's `transport` + `drainTimer` are
+    // PROCESS-LIFETIME — created once at onLoaded, no setup() to
+    // recreate them — so a per-cycle teardown would null the transport
+    // after the first cycle and every subsequent send would crash on a
+    // null handle. Both resources die cleanly at process exit
+    // (drainTimer is unref'd; the socket closes with the process).
     return {
         name: config.name ?? 'email',
         output,
         options: config,
         postprocess,
-        teardown,
     }
-}
-
-export async function teardown() {
-    if (drainTimer) {
-        clearInterval(drainTimer)
-        drainTimer = null
-    }
-    if (transport?.close) {
-        try { transport.close() } catch { /* not all transports expose close */ }
-    }
-    transport = null
 }
