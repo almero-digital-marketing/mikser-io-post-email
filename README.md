@@ -168,7 +168,59 @@ With no `transport` provided, the plugin builds a JSON transport — useful for 
 postEmail({ dryRun: process.env.NODE_ENV !== 'production' })
 ```
 
-`dryRun: true` writes every `.eml` (so authors can review them in the output folder) but skips `transport.sendMail()`. The queue still records deliveries (with `sent_at`) for observability.
+`dryRun: true` writes every `.eml` (so authors can review them in the output folder) but skips `transport.sendMail()`. The queue still records deliveries (with `sent_at`) for observability. No send-once marker is written, so a dry run never suppresses a later real delivery.
+
+## Send-once — durable delivery markers
+
+An email is delivered **once**, even across rebuilds. After a successful send
+the plugin writes a marker file into `sentFolder` (default `emails/` in the
+working folder); on every later build the marker suppresses re-delivery.
+
+This can't live in the queue table: mikser wipes its cache whenever
+`mikser.config.js` changes, and the queue rows cascade off `mikser_entities`.
+Both drop the sent state, so before markers existed a rebuild re-rendered every
+email document and re-sent the lot — a whole backlog of form submissions at
+once. The marker is on disk for the same reason the assets plugin keeps `.md5`
+sidecars there: it has to outlive the cache.
+
+```js
+postEmail({
+    from: 'Site <info@example.com>',
+    sentFolder: 'emails',   // default; relative to the working folder, or absolute
+    revision: 1,            // bump to invalidate every marker and allow a resend
+})
+```
+
+**Keep `sentFolder` out of source control and out of any deploy that deletes
+what it doesn't ship.** It is runtime delivery state, not build cache — unlike
+`assets/`, "who we already emailed" must never be committed, and if a deploy's
+`rsync --delete` removes it the backlog re-sends. Treat it like `runtime/`:
+add it to `.gitignore` and to the deploy's exclude list.
+
+### What counts as "the same email"
+
+The delivery identity is a hash of `from`, `to`, `cc`, `bcc`, `subject`, the
+rendered body, and `sendAt` — not the composed `.eml` bytes, which carry a
+fresh `Message-ID` and `Date` on every compose and would never match.
+
+`sendAt` is part of it on purpose: a recurring email keeps its id and its body
+and only moves its send time, so without it every occurrence after the first
+would look already-delivered and be silently dropped.
+
+**Volatile bodies.** If a template renders something that changes every build —
+a timestamp, a random token, a cache-buster — its hash changes too and the
+guard never matches. Name a stable identity in the entity's frontmatter
+instead, and the body stops being part of it:
+
+```yaml
+to: client@example.com
+subject: Your receipt
+deliveryKey: receipt-42
+```
+
+### Forcing a resend
+
+Delete the entity's marker file, or bump `revision` to invalidate all of them.
 
 ## Options reference
 
@@ -182,7 +234,9 @@ postEmail({ dryRun: process.env.NODE_ENV !== 'production' })
 | `transport` | nodemailer config | JSON transport | Delivery target |
 | `maxDelay` | duration string | `'1h'` | How late past `sendAt` is still acceptable |
 | `retention` | duration string | `'90d'` | How long delivered/expired rows stay in the queue |
-| `dryRun` | boolean | `false` | Write `.eml`, skip transport |
+| `sentFolder` | string | `'emails'` | Where send-once markers live; keep it gitignored and out of the deploy's delete set |
+| `revision` | number | `1` | Bump to invalidate every marker (forces a resend) |
+| `dryRun` | boolean | `false` | Write `.eml`, skip transport (and write no marker) |
 
 ## What it does NOT do (v1)
 

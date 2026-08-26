@@ -117,6 +117,24 @@ async function recordSent(config, id, hash) {
     await writeFile(file, formatMarker(config.revision ?? 1, hash))
 }
 
+// Record the marker AFTER the mail is already out, where a failure must
+// never look like a delivery failure: the message has been handed to the
+// transport and cannot be unsent. Losing the marker only risks a future
+// duplicate (and only after a cache-wipe); treating it as a send failure
+// would guarantee one — the queue path would keep the row due and
+// re-deliver every drain, and the inline path would report a render
+// failure for mail that was actually delivered. So: warn, don't throw.
+async function recordSentSafely(config, id, hash, logger) {
+    try {
+        await recordSent(config, id, hash)
+    } catch (err) {
+        logger.warn(
+            'postEmail: %s delivered but its send-once marker could not be written in %s — %s. ' +
+            'A later rebuild may re-send it; check the folder exists and is writable.',
+            id, sentFolder(config), err.message || err)
+    }
+}
+
 // ---------- queue ops ------------------------------------------------
 
 function upsertQueueRow({ id, emlPath, emlHash, sendAt }) {
@@ -198,6 +216,15 @@ async function drain({ config, logger }) {
             continue
         }
 
+        // Rows queued by < 1.1.0 predate eml_hash, so they carry no
+        // delivery identity and cannot be marked. They still send, but
+        // say so: this one row may re-send once after the upgrade.
+        if (!row.eml_hash) {
+            logger.warn(
+                'postEmail: %s was queued before send-once tracking existed — delivering without a marker, ' +
+                'so a rebuild may re-send it once.', row.id)
+        }
+
         try {
             const emlAbs = path.isAbsolute(row.eml_path)
                 ? row.eml_path
@@ -205,11 +232,17 @@ async function drain({ config, logger }) {
             const raw = await readFile(emlAbs)
             if (config.dryRun) {
                 logger.info('postEmail: [dryRun] would deliver %s', row.id)
+                markSent(row.id)
             } else {
                 await transport.sendMail({ raw })
-                if (row.eml_hash) await recordSent(config, row.id, row.eml_hash)
+                // Order matters: the mail is out, so retire the row FIRST.
+                // If the marker write were inside this try and threw, the
+                // catch below would markFailed() and leave the row due —
+                // re-delivering the same message every drain (~every 60s
+                // in watch mode) until it expires.
+                markSent(row.id)
+                if (row.eml_hash) await recordSentSafely(config, row.id, row.eml_hash, logger)
             }
-            markSent(row.id)
             logger.info('postEmail: delivered %s', row.id)
         } catch (err) {
             markFailed(row.id, err)
@@ -250,7 +283,13 @@ export async function postprocess({ entity, options, config, logger }) {
 
     // Send-once identity for this delivery (semantic fields, not the .eml
     // bytes — those carry a fresh Message-ID/Date every compose).
-    const hash = deliveryHash({ from, to, cc, bcc, subject, html })
+    // sendAt is part of it, so a rescheduled occurrence of a recurring
+    // email is a NEW delivery rather than a suppressed duplicate.
+    const hash = deliveryHash({
+        from, to, cc, bcc, subject, html,
+        sendAt: entity.meta?.sendAt,
+        deliveryKey: entity.meta?.deliveryKey,
+    })
 
     // Already delivered this exact content? Skip delivery — whatever the
     // timing. The .eml audit file above is still refreshed; only the send
@@ -278,7 +317,8 @@ export async function postprocess({ entity, options, config, logger }) {
                 logger.info('postEmail: [dryRun] would deliver %s', entity.id)
             } else {
                 await transport.sendMail({ from, to, cc, bcc, subject, html })
-                await recordSent(config, entity.id, hash)
+                // Outside the throw path on purpose — see recordSentSafely.
+                await recordSentSafely(config, entity.id, hash, logger)
             }
             logger.info('postEmail: delivered %s', entity.id)
         } catch (err) {
@@ -301,10 +341,20 @@ export function postEmail(config = {}) {
 
         // Migrate pre-1.1 installs: the queue table predates eml_hash, and
         // CREATE TABLE IF NOT EXISTS won't add a column to an existing one.
+        //
+        // Only "already there" is expected and silent. Anything else — a
+        // locked or read-only database — must be said out loud: swallowing
+        // it leaves the table without the column, and the failure resurfaces
+        // later as an opaque "no column named eml_hash" from an INSERT
+        // inside postprocess, far from its cause.
         try {
             const db = useDatabase()
             if (db?.isOpen) db.handle.exec(`ALTER TABLE mikser_post_email_queue ADD COLUMN eml_hash TEXT`)
-        } catch { /* column already present */ }
+        } catch (err) {
+            if (!/duplicate column/i.test(err.message || '')) {
+                logger.error('postEmail: could not add the eml_hash column — %s', err.message || err)
+            }
+        }
 
         onFinalized(async () => {
             try {

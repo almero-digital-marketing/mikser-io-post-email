@@ -7,7 +7,7 @@ import {
     parseDuration, humanizeMs,
     resolveSpec, dedupe, resolveAddresses,
     decideTiming,
-    deliveryHash, markerName, formatMarker, isDelivered,
+    deliveryHash, markerName, formatMarker, isDelivered, normalizeSendAt,
 } from '../lib/pure.js'
 
 describe('parseDuration', () => {
@@ -195,12 +195,86 @@ describe('deliveryHash', () => {
     })
 })
 
-describe('markerName', () => {
-    it('collapses path-hostile characters to _', () => {
-        assert.equal(markerName('/franchise/123-request'), '_franchise_123-request.sent')
+describe('normalizeSendAt', () => {
+    it('treats absent and "now" as the same immediate send', () => {
+        assert.equal(normalizeSendAt(undefined), null)
+        assert.equal(normalizeSendAt(null), null)
+        assert.equal(normalizeSendAt('now'), null)
     })
-    it('keeps portable characters', () => {
-        assert.equal(markerName('a.B_9-x'), 'a.B_9-x.sent')
+    it('keeps a real timestamp', () => {
+        assert.equal(normalizeSendAt('2026-09-01T10:00:00Z'), '2026-09-01T10:00:00Z')
+        assert.equal(normalizeSendAt(1_700_000_000_000), '1700000000000')
+    })
+})
+
+describe('deliveryHash — sendAt is part of the identity', () => {
+    const base = { from: 'me@x.com', to: 'a@x.com', subject: 'Weekly digest', html: '<p>same</p>' }
+
+    // Regression: a recurring email keeps its id, recipients and body and
+    // only moves sendAt. Hashing without sendAt made every occurrence after
+    // the first look already-delivered, so it was silently never sent.
+    it('a rescheduled occurrence of identical content is a NEW delivery', () => {
+        const week1 = deliveryHash({ ...base, sendAt: '2026-09-01T08:00:00Z' })
+        const week2 = deliveryHash({ ...base, sendAt: '2026-09-08T08:00:00Z' })
+        assert.notEqual(week1, week2)
+    })
+    it('the same occurrence still hashes stably (rebuild ⇒ no resend)', () => {
+        const a = deliveryHash({ ...base, sendAt: '2026-09-01T08:00:00Z' })
+        const b = deliveryHash({ ...base, sendAt: '2026-09-01T08:00:00Z' })
+        assert.equal(a, b)
+    })
+    it('absent and "now" sendAt are equivalent', () => {
+        assert.equal(deliveryHash(base), deliveryHash({ ...base, sendAt: 'now' }))
+    })
+})
+
+describe('deliveryHash — deliveryKey pins volatile bodies', () => {
+    const base = { from: 'me@x.com', to: 'a@x.com', subject: 'Receipt' }
+
+    it('a changing body does not change the hash when a key is set', () => {
+        const a = deliveryHash({ ...base, html: '<p>generated 10:00:01</p>', deliveryKey: 'receipt-42' })
+        const b = deliveryHash({ ...base, html: '<p>generated 23:59:59</p>', deliveryKey: 'receipt-42' })
+        assert.equal(a, b)
+    })
+    it('a different key is a different delivery', () => {
+        const a = deliveryHash({ ...base, html: '<p>x</p>', deliveryKey: 'receipt-42' })
+        const b = deliveryHash({ ...base, html: '<p>x</p>', deliveryKey: 'receipt-43' })
+        assert.notEqual(a, b)
+    })
+    it('without a key the body still counts', () => {
+        assert.notEqual(
+            deliveryHash({ ...base, html: '<p>a</p>' }),
+            deliveryHash({ ...base, html: '<p>b</p>' }),
+        )
+    })
+})
+
+describe('markerName', () => {
+    it('keeps a readable prefix and appends a disambiguating digest', () => {
+        assert.match(markerName('/franchise/123-request'), /^_franchise_123-request-[0-9a-f]{12}\.sent$/)
+    })
+
+    // Regression: sanitizing alone mapped every unsafe char to '_', so ids
+    // that differ only in unsafe characters — including any two same-length
+    // Cyrillic paths — produced ONE marker file. Colliding entities then
+    // overwrote each other and both re-sent on every rebuild.
+    it('does not collide for same-length non-ASCII ids', () => {
+        assert.notEqual(markerName('/бг/оферта'), markerName('/бг/заявка'))
+    })
+    it('does not collide for ids differing only in unsafe characters', () => {
+        assert.notEqual(markerName('/mail/a:b'), markerName('/mail/a/b'))
+    })
+    it('is stable for the same id', () => {
+        assert.equal(markerName('/mail/x'), markerName('/mail/x'))
+    })
+    it('bounds the filename for very long ids', () => {
+        const name = markerName('/' + 'x'.repeat(500))
+        assert.ok(name.length <= 140, `too long: ${name.length}`)
+    })
+    it('still separates long ids that share a truncated prefix', () => {
+        const a = markerName('/' + 'x'.repeat(300) + 'a')
+        const b = markerName('/' + 'x'.repeat(300) + 'b')
+        assert.notEqual(a, b)
     })
 })
 
