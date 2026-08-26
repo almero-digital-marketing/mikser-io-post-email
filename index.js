@@ -1,5 +1,6 @@
 import path from 'node:path'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import nodemailer from 'nodemailer'
 import {
     runtime,
@@ -14,6 +15,10 @@ import {
     humanizeMs,
     resolveAddresses,
     decideTiming,
+    deliveryHash,
+    markerName,
+    formatMarker,
+    isDelivered,
 } from './lib/pure.js'
 
 // Re-export pure helpers so callers (and tests) can import them
@@ -36,6 +41,7 @@ registerSchema('post_email', `
     CREATE TABLE IF NOT EXISTS mikser_post_email_queue (
         id          TEXT PRIMARY KEY REFERENCES mikser_entities(id) ON DELETE CASCADE,
         eml_path    TEXT NOT NULL,
+        eml_hash    TEXT,
         send_at     INTEGER NOT NULL,
         sent_at     INTEGER,
         expired_at  INTEGER,
@@ -68,20 +74,64 @@ async function composeEml({ from, to, cc, bcc, subject, html }) {
     return built.message
 }
 
+// ---------- send-once ledger -----------------------------------------
+//
+// Durable on-disk delivery markers, so a rebuild never re-sends an email
+// already delivered. The queue table can't gate this: mikser wipes its
+// cache on a config change, and the queue rows cascade off
+// mikser_entities — both drop sent state, and every submission then
+// re-renders and re-fires. So the marker lives OUTSIDE the cache, in a
+// dedicated folder (default `emails/` under the working folder,
+// overridable via `sentFolder`). Mirrors the assets plugin's `.md5`
+// sidecars. Keep this folder out of source control and out of the
+// deploy's delete set.
+const DEFAULT_SENT_FOLDER = 'emails'
+
+function sentFolder(config) {
+    const folder = config.sentFolder ?? DEFAULT_SENT_FOLDER
+    return path.isAbsolute(folder)
+        ? folder
+        : path.join(runtime.options.workingFolder, folder)
+}
+
+function markerFile(config, id) {
+    return path.join(sentFolder(config), markerName(id))
+}
+
+// Has this exact content (at/above the current revision) already been
+// delivered for this id? Disk is the source of truth — it survives the
+// cache-wipe that the DB does not.
+async function alreadySent(config, id, hash) {
+    const file = markerFile(config, id)
+    if (!existsSync(file)) return false
+    try {
+        return isDelivered(await readFile(file, 'utf8'), config.revision ?? 1, hash)
+    } catch {
+        return false
+    }
+}
+
+async function recordSent(config, id, hash) {
+    const file = markerFile(config, id)
+    await mkdir(path.dirname(file), { recursive: true })
+    await writeFile(file, formatMarker(config.revision ?? 1, hash))
+}
+
 // ---------- queue ops ------------------------------------------------
 
-function upsertQueueRow({ id, emlPath, sendAt }) {
+function upsertQueueRow({ id, emlPath, emlHash, sendAt }) {
     useDatabase().handle.prepare(`
-        INSERT INTO mikser_post_email_queue (id, eml_path, send_at)
-        VALUES (?, ?, ?)
+        INSERT INTO mikser_post_email_queue (id, eml_path, eml_hash, send_at)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             send_at    = excluded.send_at,
             eml_path   = excluded.eml_path,
+            eml_hash   = excluded.eml_hash,
             sent_at    = NULL,
             expired_at = NULL,
             attempts   = 0,
             last_error = NULL
-    `).run(id, emlPath, sendAt)
+    `).run(id, emlPath, emlHash, sendAt)
 }
 
 function recordExpiredInBand({ id, emlPath, sendAt, reason }) {
@@ -120,7 +170,7 @@ async function drain({ config, logger }) {
     `).run(now - retentionMs, now - retentionMs)
 
     const due = db.handle.prepare(`
-        SELECT id, eml_path, send_at FROM mikser_post_email_queue
+        SELECT id, eml_path, eml_hash, send_at FROM mikser_post_email_queue
         WHERE sent_at IS NULL AND expired_at IS NULL AND send_at <= ?
         ORDER BY send_at
     `).all(now)
@@ -139,6 +189,15 @@ async function drain({ config, logger }) {
             continue
         }
 
+        // Durable send-once guard: an on-disk marker means this exact
+        // content was already delivered (survives the cache-wipe that
+        // reset the row's sent_at). Mark sent and skip re-delivery.
+        if (row.eml_hash && await alreadySent(config, row.id, row.eml_hash)) {
+            markSent(row.id)
+            logger.info('postEmail: %s already delivered, skipping', row.id)
+            continue
+        }
+
         try {
             const emlAbs = path.isAbsolute(row.eml_path)
                 ? row.eml_path
@@ -148,6 +207,7 @@ async function drain({ config, logger }) {
                 logger.info('postEmail: [dryRun] would deliver %s', row.id)
             } else {
                 await transport.sendMail({ raw })
+                if (row.eml_hash) await recordSent(config, row.id, row.eml_hash)
             }
             markSent(row.id)
             logger.info('postEmail: delivered %s', row.id)
@@ -188,23 +248,37 @@ export async function postprocess({ entity, options, config, logger }) {
     const eml = await composeEml({ from, to, cc, bcc, subject, html })
     await writeFile(outputPath, eml)
 
+    // Send-once identity for this delivery (semantic fields, not the .eml
+    // bytes — those carry a fresh Message-ID/Date every compose).
+    const hash = deliveryHash({ from, to, cc, bcc, subject, html })
+
+    // Already delivered this exact content? Skip delivery — whatever the
+    // timing. The .eml audit file above is still refreshed; only the send
+    // is suppressed. This is what stops a rebuild (e.g. after a
+    // config-change cache-wipe) from re-firing the whole submission backlog.
+    if (await alreadySent(config, entity.id, hash)) {
+        logger.info('postEmail: %s already delivered, skipping', entity.id)
+        return { success: true, result: entity.destination }
+    }
+
     const maxDelayMs = parseDuration(entity.meta?.maxDelay ?? config.maxDelay, DEFAULT_MAX_DELAY_MS)
     const timing = decideTiming({ meta: entity.meta ?? {}, maxDelayMs })
 
     if (timing.mode === 'queue') {
-        upsertQueueRow({ id: entity.id, emlPath: entity.destination, sendAt: timing.sendAt })
+        upsertQueueRow({ id: entity.id, emlPath: entity.destination, emlHash: hash, sendAt: timing.sendAt })
         logger.info('postEmail: queued %s for %s', entity.id, new Date(timing.sendAt).toISOString())
     } else if (timing.mode === 'expired') {
         const reason = `overdue by ${humanizeMs(timing.overdueMs)}, past maxDelay ${humanizeMs(maxDelayMs)}`
         recordExpiredInBand({ id: entity.id, emlPath: entity.destination, sendAt: timing.sendAt, reason })
         logger.warn('postEmail: %s expired in-band — %s', entity.id, reason)
     } else {
-        // mode === 'now' — deliver synchronously.
+        // mode === 'now' — deliver synchronously, once.
         try {
             if (config.dryRun) {
                 logger.info('postEmail: [dryRun] would deliver %s', entity.id)
             } else {
                 await transport.sendMail({ from, to, cc, bcc, subject, html })
+                await recordSent(config, entity.id, hash)
             }
             logger.info('postEmail: delivered %s', entity.id)
         } catch (err) {
@@ -224,6 +298,13 @@ export function postEmail(config = {}) {
     onLoaded(async () => {
         const logger = useLogger()
         transport = nodemailer.createTransport(config.transport ?? { jsonTransport: true })
+
+        // Migrate pre-1.1 installs: the queue table predates eml_hash, and
+        // CREATE TABLE IF NOT EXISTS won't add a column to an existing one.
+        try {
+            const db = useDatabase()
+            if (db?.isOpen) db.handle.exec(`ALTER TABLE mikser_post_email_queue ADD COLUMN eml_hash TEXT`)
+        } catch { /* column already present */ }
 
         onFinalized(async () => {
             try {

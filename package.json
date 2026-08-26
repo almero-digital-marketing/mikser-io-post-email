@@ -1,6 +1,6 @@
 {
   "name": "mikser-io-post-email",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Email postprocessor for mikser-io — sends rendered output via SMTP and writes .eml audit files. Composes after post-mjml in a chain.",
   "main": "index.js",
   "type": "module",

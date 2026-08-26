@@ -7,6 +7,7 @@ import {
     parseDuration, humanizeMs,
     resolveSpec, dedupe, resolveAddresses,
     decideTiming,
+    deliveryHash, markerName, formatMarker, isDelivered,
 } from '../lib/pure.js'
 
 describe('parseDuration', () => {
@@ -171,5 +172,55 @@ describe('decideTiming', () => {
     })
     it('garbage sendAt throws', () => {
         assert.throws(() => decideTiming({ meta: { sendAt: 'soon' }, maxDelayMs: oneHour, now }))
+    })
+})
+
+describe('deliveryHash', () => {
+    const base = { from: 'me@x.com', to: 'a@x.com', subject: 'Hi', html: '<p>hi</p>' }
+    it('is deterministic for the same content', () => {
+        assert.equal(deliveryHash(base), deliveryHash({ ...base }))
+    })
+    it('changes when subject or body changes', () => {
+        assert.notEqual(deliveryHash(base), deliveryHash({ ...base, subject: 'Hi!' }))
+        assert.notEqual(deliveryHash(base), deliveryHash({ ...base, html: '<p>bye</p>' }))
+    })
+    it('treats array and joined-string recipients the same', () => {
+        assert.equal(
+            deliveryHash({ ...base, to: ['a@x.com', 'b@x.com'] }),
+            deliveryHash({ ...base, to: 'a@x.com,b@x.com' }),
+        )
+    })
+    it('returns a 64-char hex sha256', () => {
+        assert.match(deliveryHash(base), /^[0-9a-f]{64}$/)
+    })
+})
+
+describe('markerName', () => {
+    it('collapses path-hostile characters to _', () => {
+        assert.equal(markerName('/franchise/123-request'), '_franchise_123-request.sent')
+    })
+    it('keeps portable characters', () => {
+        assert.equal(markerName('a.B_9-x'), 'a.B_9-x.sent')
+    })
+})
+
+describe('formatMarker / isDelivered', () => {
+    const h = 'a'.repeat(64)
+    it('round-trips a delivered marker', () => {
+        assert.equal(isDelivered(formatMarker(1, h), 1, h), true)
+    })
+    it('treats a higher stored revision as delivered', () => {
+        assert.equal(isDelivered(formatMarker(3, h), 2, h), true)
+    })
+    it('rejects a lower stored revision (force-resend on bump)', () => {
+        assert.equal(isDelivered(formatMarker(1, h), 2, h), false)
+    })
+    it('rejects a different hash (content changed)', () => {
+        assert.equal(isDelivered(formatMarker(1, h), 1, 'b'.repeat(64)), false)
+    })
+    it('rejects malformed or missing markers', () => {
+        assert.equal(isDelivered('', 1, h), false)
+        assert.equal(isDelivered('garbage', 1, h), false)
+        assert.equal(isDelivered(undefined, 1, h), false)
     })
 })
