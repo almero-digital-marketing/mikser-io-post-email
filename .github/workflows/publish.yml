@@ -1,0 +1,85 @@
+# Publish to npm without a stored token.
+#
+# npm is retiring tokens that skip the second factor — its own token page says
+# "Publish new versions directly (deprecated — ends January 2027)". This is the
+# replacement: the job proves who it is at publish time with a short-lived
+# credential GitHub issues and npm verifies, so npm trusts "the publish.yml
+# workflow in this repository" rather than a string.
+#
+# There is no NODE_AUTH_TOKEN and no secret to configure. Nothing to leak,
+# expire or rotate — the two ways publishing broke in September 2026.
+#
+# Link it once on npm: the package → Settings → Trusted Publisher → GitHub
+# Actions, naming this repository and this filename. Until that exists the
+# publish step fails rather than falling back to something weaker.
+
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The whole mechanism. Without it npm has nothing to verify.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing landed in npm 11.5.1.
+      - name: Use an npm that can do trusted publishing
+        run: npm install -g npm@latest
+
+      # `npm install`, not `npm ci`: these packages are developed in a
+      # workspace, so dependencies hoist to its root and each package's own
+      # lockfile is never read locally. They drift silently, and CI is the only
+      # thing that would ever read them.
+      - run: npm install --no-audit --no-fund
+        env:
+          # puppeteer downloads a browser on install; nothing in the release
+          # path renders a page.
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+
+      # The tag is the release. A tag that disagrees with package.json would
+      # publish a version nobody asked for.
+      - name: Tag must match package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p 'require("./package.json").version')"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "tag v$TAG does not match package.json $PKG"
+            exit 1
+          fi
+          echo "publishing $PKG"
+
+      # No test step, and that is a statement about these packages rather than
+      # a shortcut.
+      #
+      # Their suites import sibling packages — mikser-io itself, and things
+      # like mikser-io-render-liquid — that are not declared as
+      # devDependencies. They resolve locally only because everything is
+      # developed inside one workspace, where npm hoists siblings into a shared
+      # node_modules. A standalone clone, which is what CI checks out, has
+      # none of them: mikser-io-layouts fails three of its four files on
+      # "Cannot find package 'mikser-io-render-liquid'" before running a
+      # single assertion.
+      #
+      # Running them here would mean a red release for a missing dependency
+      # rather than a broken package, every time. So tests stay what they
+      # already are: the thing you run in the workspace before tagging.
+      #
+      # Declaring the real devDependencies would let CI run them, and is worth
+      # doing — package by package, deliberately, not as a side effect of
+      # wiring up publishing at midnight.
+
+      - run: npm publish --access public
