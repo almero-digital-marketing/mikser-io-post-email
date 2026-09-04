@@ -62,24 +62,12 @@ jobs:
           fi
           echo "publishing $PKG"
 
-      # No test step, and that is a statement about these packages rather than
-      # a shortcut.
-      #
-      # Their suites import sibling packages — mikser-io itself, and things
-      # like mikser-io-render-liquid — that are not declared as
-      # devDependencies. They resolve locally only because everything is
-      # developed inside one workspace, where npm hoists siblings into a shared
-      # node_modules. A standalone clone, which is what CI checks out, has
-      # none of them: mikser-io-layouts fails three of its four files on
-      # "Cannot find package 'mikser-io-render-liquid'" before running a
-      # single assertion.
-      #
-      # Running them here would mean a red release for a missing dependency
-      # rather than a broken package, every time. So tests stay what they
-      # already are: the thing you run in the workspace before tagging.
-      #
-      # Declaring the real devDependencies would let CI run them, and is worth
-      # doing — package by package, deliberately, not as a side effect of
-      # wiring up publishing at midnight.
+      # The suite runs here now. It did not before: these packages declared
+      # mikser-io only as a peerDependency (npm does not install a package's
+      # own peers) or as file:../mikser-io (a path that exists on a laptop and
+      # nowhere else), so a standalone clone could not resolve the engine it
+      # tests against. Both are now real devDependencies with version ranges,
+      # which npm still satisfies from the workspace locally.
+      - run: npm test
 
       - run: npm publish --access public
