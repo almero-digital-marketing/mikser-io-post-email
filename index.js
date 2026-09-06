@@ -397,6 +397,6 @@ export function postEmail(config = {}) {
         name: config.name ?? 'email',
         output,
         options: config,
-        postprocess,
+        postprocess, module: import.meta.url,
     }
 }
