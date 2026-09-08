@@ -19,6 +19,8 @@ import {
     markerName,
     formatMarker,
     isDelivered,
+    sendWithTimeout,
+    backoffDelay,
 } from './lib/pure.js'
 
 // Re-export pure helpers so callers (and tests) can import them
@@ -28,6 +30,8 @@ export {
     humanizeMs,
     resolveAddresses,
     decideTiming,
+    sendWithTimeout,
+    backoffDelay,
 } from './lib/pure.js'
 
 // Postprocessor name — used in chain syntax (`welcome.html-mjml-email.hbs`)
@@ -39,23 +43,44 @@ export const output = 'eml'
 // prepend `mikser_`. `mikser-io-post-email` → `mikser_post_email_*`.
 registerSchema('post_email', `
     CREATE TABLE IF NOT EXISTS mikser_post_email_queue (
-        id          TEXT PRIMARY KEY REFERENCES mikser_entities(id) ON DELETE CASCADE,
-        eml_path    TEXT NOT NULL,
-        eml_hash    TEXT,
-        send_at     INTEGER NOT NULL,
-        sent_at     INTEGER,
-        expired_at  INTEGER,
-        attempts    INTEGER NOT NULL DEFAULT 0,
-        last_error  TEXT
+        id              TEXT PRIMARY KEY REFERENCES mikser_entities(id) ON DELETE CASCADE,
+        eml_path        TEXT NOT NULL,
+        eml_hash        TEXT,
+        -- The message as fields (JSON), which is how it is DELIVERED.
+        --
+        -- Not the .eml on disk: that is an audit artifact, and re-reading it
+        -- to send a raw message made delivery depend both on the output tree
+        -- still holding the file (a --clear, or a deploy rsync with --delete,
+        -- removes it) and on the transport honouring nodemailer's raw field
+        -- at all. Mailgun's does not: nodemailer-mailgun-transport applies a
+        -- key whitelist with no raw in it, so the field is dropped and what
+        -- reaches the API has no sender, no recipient and no body.
+        --
+        -- Cleared on delivery; a sent row does not need to keep the body.
+        payload         TEXT,
+        -- When delivery was ASKED for. maxDelay is measured from it, so it is
+        -- never moved once written.
+        send_at         INTEGER NOT NULL,
+        -- When the next attempt may run. Set by a failed attempt's backoff;
+        -- separate from send_at precisely so backing off cannot make a row
+        -- that keeps failing look permanently on-time and never expire.
+        next_attempt_at INTEGER,
+        sent_at         INTEGER,
+        expired_at      INTEGER,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        last_error      TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_mikser_post_email_queue_due
         ON mikser_post_email_queue (send_at)
         WHERE sent_at IS NULL AND expired_at IS NULL;
 `)
 
-const DEFAULT_MAX_DELAY_MS = 60 * 60 * 1000                 // 1h
-const DEFAULT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000       // 90d
-const DRAIN_INTERVAL_MS    = 60 * 1000                      // 60s in watch mode
+const DEFAULT_MAX_DELAY_MS    = 60 * 60 * 1000              // 1h
+const DEFAULT_RETENTION_MS    = 90 * 24 * 60 * 60 * 1000    // 90d
+const DEFAULT_SEND_TIMEOUT_MS = 30 * 1000                   // per message
+const DRAIN_INTERVAL_MS       = 60 * 1000                   // while resident
+const BACKOFF_BASE_MS         = 60 * 1000                   // 1st retry
+const BACKOFF_MAX_MS          = 15 * 60 * 1000              // ceiling
 
 // Per-config closures populate this on onLoaded. Module-level so the
 // postprocess() call (which is per-entity, may run on workers in
@@ -63,6 +88,14 @@ const DRAIN_INTERVAL_MS    = 60 * 1000                      // 60s in watch mode
 // share the same transport handle.
 let transport = null
 let drainTimer = null
+
+// The drain is SINGLE-FLIGHT, and has to be: a pass delivers sequentially and
+// only marks a row sent once the transport has answered, so a second pass
+// starting while the first is still in flight selects the same unmarked rows
+// and delivers them a second time. There are two callers (the timer, and
+// onFinalized for one-shot builds) and a backlog can easily outlast the 60s
+// interval — 1515 queued messages did, on gpoint.bg.
+let draining = false
 
 // ---------- EML composition + delivery -------------------------------
 
@@ -137,19 +170,21 @@ async function recordSentSafely(config, id, hash, logger) {
 
 // ---------- queue ops ------------------------------------------------
 
-function upsertQueueRow({ id, emlPath, emlHash, sendAt }) {
+function upsertQueueRow({ id, emlPath, emlHash, sendAt, payload }) {
     useDatabase().handle.prepare(`
-        INSERT INTO mikser_post_email_queue (id, eml_path, eml_hash, send_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO mikser_post_email_queue (id, eml_path, eml_hash, payload, send_at)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
-            send_at    = excluded.send_at,
-            eml_path   = excluded.eml_path,
-            eml_hash   = excluded.eml_hash,
-            sent_at    = NULL,
-            expired_at = NULL,
-            attempts   = 0,
-            last_error = NULL
-    `).run(id, emlPath, emlHash, sendAt)
+            send_at         = excluded.send_at,
+            eml_path        = excluded.eml_path,
+            eml_hash        = excluded.eml_hash,
+            payload         = excluded.payload,
+            sent_at         = NULL,
+            expired_at      = NULL,
+            next_attempt_at = NULL,
+            attempts        = 0,
+            last_error      = NULL
+    `).run(id, emlPath, emlHash, payload == null ? null : JSON.stringify(payload), sendAt)
 }
 
 function recordExpiredInBand({ id, emlPath, sendAt, reason }) {
@@ -166,13 +201,82 @@ function recordExpiredInBand({ id, emlPath, sendAt, reason }) {
     `).run(id, emlPath, sendAt, Date.now(), reason)
 }
 
-function markSent(id)        { useDatabase().handle.prepare(`UPDATE mikser_post_email_queue SET sent_at = ? WHERE id = ?`).run(Date.now(), id) }
-function markExpired(id, r)  { useDatabase().handle.prepare(`UPDATE mikser_post_email_queue SET expired_at = ?, last_error = ? WHERE id = ?`).run(Date.now(), r, id) }
-function markFailed(id, err) { useDatabase().handle.prepare(`UPDATE mikser_post_email_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?`).run(err.message || String(err), id) }
+// `payload` is released here: the row stays for its retention window as a
+// record that this id was delivered, and a delivered message body has no
+// further use — keeping every rendered email in the cache DB for 90 days does.
+function markSent(id)        { useDatabase().handle.prepare(`UPDATE mikser_post_email_queue SET sent_at = ?, payload = NULL WHERE id = ?`).run(Date.now(), id) }
+// payload released for the same reason as in markSent — an expired row is
+// never delivered, so holding its body for the retention window is pure cost.
+function markExpired(id, r)  { useDatabase().handle.prepare(`UPDATE mikser_post_email_queue SET expired_at = ?, last_error = ?, payload = NULL WHERE id = ?`).run(Date.now(), r, id) }
+// A failed attempt stays queued, but not due again immediately. Retrying a
+// flapping provider every 60s only multiplies the load on it, and for an
+// attempt that TIMED OUT rather than been refused it multiplies the
+// duplicates — the message may well have gone out. So back off exponentially
+// in `next_attempt_at` and leave `send_at` untouched: `send_at` is the
+// delivery intent and maxDelay is measured from it, so moving it would make a
+// row that keeps failing look permanently on-time and never expire.
+//
+// Returns the delay it set, for the caller to log.
+function markFailed(id, err) {
+    const row = useDatabase().handle
+        .prepare(`SELECT attempts FROM mikser_post_email_queue WHERE id = ?`).get(id)
+    const delay = backoffDelay({ attempts: row?.attempts, baseMs: BACKOFF_BASE_MS, maxMs: BACKOFF_MAX_MS })
+    useDatabase().handle.prepare(`
+        UPDATE mikser_post_email_queue
+        SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+        WHERE id = ?
+    `).run(err.message || String(err), Date.now() + delay, id)
+    return delay
+}
+
+// Hand one message to the transport under a per-message timeout — see
+// sendWithTimeout in lib/pure.js for why an unbounded send is not an option.
+// `sendTimeout: 0` opts out.
+function sendMailWithTimeout({ config, payload }) {
+    return sendWithTimeout({
+        send: message => transport.sendMail(message),
+        payload,
+        timeoutMs: parseDuration(config.sendTimeout, DEFAULT_SEND_TIMEOUT_MS),
+    })
+}
+
+// What to hand the transport for a queued row: the stored fields, or — for a
+// row queued by a version that did not store them — the composed .eml re-read
+// from disk. That fallback is best-effort by nature: it survives only while
+// the file is still in the output tree, and only reaches the provider intact
+// on a transport that honours `raw`, which SMTP does and Mailgun's does not.
+async function deliveryPayload({ row, logger }) {
+    if (row.payload) return JSON.parse(row.payload)
+
+    logger.warn(
+        'postEmail: %s was queued before the message payload was stored — falling back to its .eml. ' +
+        'A transport that ignores `raw` (Mailgun) will reject it; re-render the entity to requeue it properly.',
+        row.id)
+
+    const emlAbs = path.isAbsolute(row.eml_path)
+        ? row.eml_path
+        : path.join(runtime.options.outputFolder, row.eml_path)
+    return { raw: await readFile(emlAbs) }
+}
 
 // Drain the queue: deliver due rows that are still within maxDelay,
 // expire the overdue ones. Failed deliveries stay queued for retry.
+//
+// Serialised — see `draining`. Overlapping passes double-send.
 async function drain({ config, logger }) {
+    if (draining) {
+        logger.debug('postEmail: a drain is already in flight, skipping this pass')
+        return
+    }
+    draining = true
+    try {
+        await drainQueue({ config, logger })
+    } finally {
+        draining = false
+    }
+}
+
+async function drainQueue({ config, logger }) {
     const db = useDatabase()
     if (!db?.isOpen) return
 
@@ -188,10 +292,11 @@ async function drain({ config, logger }) {
     `).run(now - retentionMs, now - retentionMs)
 
     const due = db.handle.prepare(`
-        SELECT id, eml_path, eml_hash, send_at FROM mikser_post_email_queue
+        SELECT id, eml_path, eml_hash, payload, send_at FROM mikser_post_email_queue
         WHERE sent_at IS NULL AND expired_at IS NULL AND send_at <= ?
+          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
         ORDER BY send_at
-    `).all(now)
+    `).all(now, now)
 
     for (const row of due) {
         // Cascade-race guard: catalog delete may have fired between
@@ -226,15 +331,12 @@ async function drain({ config, logger }) {
         }
 
         try {
-            const emlAbs = path.isAbsolute(row.eml_path)
-                ? row.eml_path
-                : path.join(runtime.options.outputFolder, row.eml_path)
-            const raw = await readFile(emlAbs)
+            const payload = await deliveryPayload({ row, logger })
             if (config.dryRun) {
                 logger.info('postEmail: [dryRun] would deliver %s', row.id)
                 markSent(row.id)
             } else {
-                await transport.sendMail({ raw })
+                await sendMailWithTimeout({ config, payload })
                 // Order matters: the mail is out, so retire the row FIRST.
                 // If the marker write were inside this try and threw, the
                 // catch below would markFailed() and leave the row due —
@@ -245,8 +347,9 @@ async function drain({ config, logger }) {
             }
             logger.info('postEmail: delivered %s', row.id)
         } catch (err) {
-            markFailed(row.id, err)
-            logger.error('postEmail: delivery failed for %s — %s', row.id, err.message || err)
+            const delay = markFailed(row.id, err)
+            logger.error('postEmail: delivery failed for %s, retrying in %s — %s',
+                row.id, humanizeMs(delay), err.message || err)
         }
     }
 }
@@ -303,28 +406,48 @@ export async function postprocess({ entity, options, config, logger }) {
     const maxDelayMs = parseDuration(entity.meta?.maxDelay ?? config.maxDelay, DEFAULT_MAX_DELAY_MS)
     const timing = decideTiming({ meta: entity.meta ?? {}, maxDelayMs })
 
-    if (timing.mode === 'queue') {
-        upsertQueueRow({ id: entity.id, emlPath: entity.destination, emlHash: hash, sendAt: timing.sendAt })
-        logger.info('postEmail: queued %s for %s', entity.id, new Date(timing.sendAt).toISOString())
-    } else if (timing.mode === 'expired') {
+    if (timing.mode === 'expired') {
         const reason = `overdue by ${humanizeMs(timing.overdueMs)}, past maxDelay ${humanizeMs(maxDelayMs)}`
         recordExpiredInBand({ id: entity.id, emlPath: entity.destination, sendAt: timing.sendAt, reason })
         logger.warn('postEmail: %s expired in-band — %s', entity.id, reason)
+        return { success: true, result: entity.destination }
+    }
+
+    // Both 'now' and 'queue' go through the queue. NOTHING is delivered from
+    // here any more.
+    //
+    // `postprocess` runs INSIDE the render pipeline. 'now' used to await
+    // transport.sendMail() right here, which made two things true that should
+    // never have been:
+    //
+    //   1. Every cycle waited on a third-party service. A build could not
+    //      finish until the provider had answered for every message in it —
+    //      1515 sequential Mailgun round-trips, in one case, inside the
+    //      pipeline, while the site's own requests queued behind it.
+    //   2. The provider could FAIL THE BUILD. A rejection — a 429, an
+    //      outage, a socket that never answered — threw out of postprocess
+    //      and failed the entity, so a provider having a bad minute became a
+    //      broken render, with no retry: the marker was never written, so the
+    //      next cycle simply tried again with no backoff.
+    //
+    // A row costs one sqlite insert and buys what the inline path never had:
+    // delivery that survives a crash mid-cycle, retries with backoff, a
+    // bounded per-message timeout, and a render that never waits on mail.
+    //
+    // Delivery promptness is preserved at both ends. A one-shot build drains
+    // at onFinalized, so `mikser` still sends before it exits. A resident
+    // instance drains on the timer, off the cycle, within DRAIN_INTERVAL_MS.
+    upsertQueueRow({
+        id: entity.id,
+        emlPath: entity.destination,
+        emlHash: hash,
+        payload: { from, to, cc, bcc, subject, html },
+        sendAt: timing.sendAt,
+    })
+    if (timing.mode === 'now') {
+        logger.info('postEmail: queued %s for immediate delivery', entity.id)
     } else {
-        // mode === 'now' — deliver synchronously, once.
-        try {
-            if (config.dryRun) {
-                logger.info('postEmail: [dryRun] would deliver %s', entity.id)
-            } else {
-                await transport.sendMail({ from, to, cc, bcc, subject, html })
-                // Outside the throw path on purpose — see recordSentSafely.
-                await recordSentSafely(config, entity.id, hash, logger)
-            }
-            logger.info('postEmail: delivered %s', entity.id)
-        } catch (err) {
-            logger.error('postEmail: delivery failed for %s — %s', entity.id, err.message || err)
-            throw err
-        }
+        logger.info('postEmail: queued %s for %s', entity.id, new Date(timing.sendAt).toISOString())
     }
 
     return { success: true, result: entity.destination }
@@ -339,32 +462,38 @@ export function postEmail(config = {}) {
         const logger = useLogger()
         transport = nodemailer.createTransport(config.transport ?? { jsonTransport: true })
 
-        // Migrate pre-1.1 installs: the queue table predates eml_hash, and
-        // CREATE TABLE IF NOT EXISTS won't add a column to an existing one.
+        // Bring an older queue table up to date. CREATE TABLE IF NOT EXISTS
+        // will not add a column to a table that already exists, so each one
+        // added since needs its own ALTER.
         //
         // Only "already there" is expected and silent. Anything else — a
-        // locked or read-only database — must be said out loud: swallowing
-        // it leaves the table without the column, and the failure resurfaces
-        // later as an opaque "no column named eml_hash" from an INSERT
-        // inside postprocess, far from its cause.
-        try {
-            const db = useDatabase()
-            if (db?.isOpen) db.handle.exec(`ALTER TABLE mikser_post_email_queue ADD COLUMN eml_hash TEXT`)
-        } catch (err) {
-            if (!/duplicate column/i.test(err.message || '')) {
-                logger.error('postEmail: could not add the eml_hash column — %s', err.message || err)
+        // locked or read-only database — must be said out loud: swallowing it
+        // leaves the table without the column, and the failure resurfaces
+        // later as an opaque "no column named …" from an INSERT inside
+        // postprocess, far from its cause.
+        for (const column of ['eml_hash TEXT', 'payload TEXT', 'next_attempt_at INTEGER']) {
+            try {
+                const db = useDatabase()
+                if (db?.isOpen) db.handle.exec(`ALTER TABLE mikser_post_email_queue ADD COLUMN ${column}`)
+            } catch (err) {
+                if (!/duplicate column/i.test(err.message || '')) {
+                    logger.error('postEmail: could not add the %s column — %s', column, err.message || err)
+                }
             }
         }
 
-        onFinalized(async () => {
-            try {
-                await drain({ config, logger })
-            } catch (err) {
-                logger.error('postEmail: drain failed (onFinalized) — %s', err.message || err)
-            }
-        })
-
-        if (runtime.options.watch && !drainTimer) {
+        // The timer is what makes delivery out-of-band, so it has to run
+        // whenever this process stays up — `--server` as much as `--watch`.
+        // Gated on `watch` alone it was missing from the configuration that
+        // needs it most: a production `--server` instance (no watcher, which
+        // is how gpoint-cms runs) had no timer at all, so a queued message
+        // waited for the end of the next cycle and, after the last cycle,
+        // waited indefinitely.
+        //
+        // Matches how core decides the same thing — see the residency check
+        // in mikser-io's src/instance.js.
+        const resident = runtime.options.watch || runtime.options.server
+        if (resident && !drainTimer) {
             drainTimer = setInterval(() => {
                 drain({ config, logger }).catch(err => {
                     logger.error('postEmail: drain failed (timer) — %s', err.message || err)
@@ -373,13 +502,41 @@ export function postEmail(config = {}) {
             drainTimer.unref?.()
         }
 
-        // Run one drain at startup to catch anything that came due
-        // while mikser was off. Wrapped so a startup-time delivery
-        // failure doesn't crash the boot.
-        try {
-            await drain({ config, logger })
-        } catch (err) {
-            logger.error('postEmail: startup drain failed — %s', err.message || err)
+        onFinalized(async () => {
+            // A one-shot build has no timer and exits after finalize, so the
+            // queue MUST be drained here or its mail is never sent.
+            //
+            // When a timer owns delivery, this must NOT drain: onFinalized is
+            // awaited inside the cycle, so draining here would put the
+            // third-party transport straight back on the critical path — the
+            // coupling the queue exists to break.
+            //
+            // Keyed on the timer actually existing rather than on residency,
+            // so the two conditions cannot disagree and strand the queue with
+            // neither draining it.
+            if (drainTimer) return
+            try {
+                await drain({ config, logger })
+            } catch (err) {
+                logger.error('postEmail: drain failed (onFinalized) — %s', err.message || err)
+            }
+        })
+
+        // One drain at startup, to catch whatever came due while mikser was
+        // off. Awaited only when nothing else will drain: a resident instance
+        // gets this fired and forgotten, because awaiting it here is how a
+        // restart with a backlog spent its boot inside the transport —
+        // 1515 messages, one at a time, before the first cycle ran.
+        if (drainTimer) {
+            drain({ config, logger }).catch(err => {
+                logger.error('postEmail: startup drain failed — %s', err.message || err)
+            })
+        } else {
+            try {
+                await drain({ config, logger })
+            } catch (err) {
+                logger.error('postEmail: startup drain failed — %s', err.message || err)
+            }
         }
     })
 

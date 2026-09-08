@@ -8,6 +8,7 @@ import {
     resolveSpec, dedupe, resolveAddresses,
     decideTiming,
     deliveryHash, markerName, formatMarker, isDelivered, normalizeSendAt,
+    sendWithTimeout, backoffDelay,
 } from '../lib/pure.js'
 
 describe('parseDuration', () => {
@@ -296,5 +297,82 @@ describe('formatMarker / isDelivered', () => {
         assert.equal(isDelivered('', 1, h), false)
         assert.equal(isDelivered('garbage', 1, h), false)
         assert.equal(isDelivered(undefined, 1, h), false)
+    })
+})
+
+describe('sendWithTimeout', () => {
+    it('passes the payload through and returns what the transport returned', async () => {
+        const seen = []
+        const result = await sendWithTimeout({
+            send: async message => { seen.push(message); return { messageId: 'ok' } },
+            payload: { to: ['a@example.com'] },
+            timeoutMs: 1000,
+        })
+        assert.deepEqual(seen, [{ to: ['a@example.com'] }])
+        assert.deepEqual(result, { messageId: 'ok' })
+    })
+
+    it('rejects when the transport does not answer in time', async () => {
+        await assert.rejects(
+            sendWithTimeout({
+                send: () => new Promise(() => {}),   // never settles
+                payload: {},
+                timeoutMs: 20,
+            }),
+            /did not answer within/)
+    })
+
+    it('lets a real transport error through unchanged', async () => {
+        await assert.rejects(
+            sendWithTimeout({
+                send: async () => { throw new Error('421 rate limited') },
+                payload: {},
+                timeoutMs: 1000,
+            }),
+            /421 rate limited/)
+    })
+
+    it('waits forever when the timeout is falsy', async () => {
+        // Opting out must not wrap the call at all: a send that takes longer
+        // than any plausible timeout still resolves.
+        const result = await sendWithTimeout({
+            send: () => new Promise(resolve => setTimeout(() => resolve('late'), 30)),
+            payload: {},
+            timeoutMs: 0,
+        })
+        assert.equal(result, 'late')
+    })
+
+    it('does not leave a pending timer behind on success', async () => {
+        // A leaked timer keeps the event loop alive for the rest of the
+        // timeout — for a one-shot build that is the process refusing to exit.
+        const before = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length
+        await sendWithTimeout({ send: async () => 'sent', payload: {}, timeoutMs: 60_000 })
+        const after = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length
+        assert.equal(after, before)
+    })
+})
+
+describe('backoffDelay', () => {
+    const opts = { baseMs: 60_000, maxMs: 900_000 }
+
+    it('waits the base delay after the first failure', () => {
+        assert.equal(backoffDelay({ attempts: 0, ...opts }), 60_000)
+    })
+    it('doubles with each attempt already made', () => {
+        assert.equal(backoffDelay({ attempts: 1, ...opts }), 120_000)
+        assert.equal(backoffDelay({ attempts: 2, ...opts }), 240_000)
+        assert.equal(backoffDelay({ attempts: 3, ...opts }), 480_000)
+    })
+    it('caps at maxMs instead of growing without bound', () => {
+        assert.equal(backoffDelay({ attempts: 4, ...opts }), 900_000)
+        assert.equal(backoffDelay({ attempts: 40, ...opts }), 900_000)
+    })
+    it('treats a missing or junk attempt count as none made', () => {
+        // attempts comes straight from a sqlite row, which can be null on a
+        // row written before the column existed.
+        assert.equal(backoffDelay({ attempts: null, ...opts }), 60_000)
+        assert.equal(backoffDelay({ attempts: undefined, ...opts }), 60_000)
+        assert.equal(backoffDelay({ attempts: -3, ...opts }), 60_000)
     })
 })

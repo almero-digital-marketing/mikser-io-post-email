@@ -18,7 +18,8 @@ npm install mikser-io-post-email
 
 ```js
 // mikser.config.js
-import { documents, layouts, renderHbs, frontMatter } from 'mikser-io'
+import { documents, renderHbs, frontMatter } from 'mikser-io'
+import { layouts } from 'mikser-io-layouts'
 import { postMjml } from 'mikser-io-post-mjml'
 import { postEmail } from 'mikser-io-post-email'
 
@@ -45,11 +46,24 @@ export default {
 ---
 to: alice@acme.com
 subject: Welcome, Alice
-layout: welcome.html-mjml-email
+layout: welcome          # the layout's NAME — the chain suffixes are not part of it
 ---
 ```
 
-That's the transactional case: one entity, one recipient. The `.eml` lands at `out/welcome.eml` and the message ships immediately. On the next build, mikser's render manifest sees unchanged inputs and skips the whole chain — no resend.
+That's the transactional case: one entity, one recipient. The `.eml` lands at `out/welcome.eml` and the message is queued for immediate delivery — see [Delivery is out of band](#delivery-is-out-of-band). On the next build, mikser's render manifest sees unchanged inputs and skips the whole chain — no resend.
+
+## Delivery is out of band
+
+**Nothing is ever sent from inside the render pipeline.** A postprocessor writes the `.eml`, records a queue row, and returns; the transport is called later, by the drain.
+
+That matters because a transport is a third-party service. Sending inline — which this plugin did through 11.0.x — made two things true:
+
+- **Every cycle waited on the provider.** A build could not finish until every message in it had been acknowledged. One restart with a backlog spent it on 1515 sequential Mailgun round-trips, inside the pipeline, while the site's own requests queued behind it.
+- **The provider could fail the build.** A rejection — a 429, an outage, a socket that never answered — threw out of `postprocess` and failed the entity. A provider having a bad minute became a broken render, and with no marker written and no backoff, the next cycle simply tried again.
+
+Queuing costs one sqlite row and buys delivery that survives a crash mid-cycle, retries with backoff, a bounded per-message timeout, and a render that never waits on mail.
+
+Promptness is unaffected at both ends. A one-shot `mikser` drains at `onFinalized`, so it still delivers before it exits. A resident instance (`--watch` or `--server`) drains on a 60-second timer, off the cycle — and *not* at `onFinalized`, because that hook is awaited inside the cycle and draining there would put the transport straight back on the critical path.
 
 ## Recipient lists — `@listname` references
 
@@ -114,9 +128,9 @@ Resolution against `maxDelay` (default `'1h'`):
 
 | `sendAt` | What happens |
 |---|---|
-| missing / `'now'` | Deliver immediately during the chain |
+| missing / `'now'` | Write `.eml`, queue a row due now, deliver on the next drain |
 | future | Write `.eml`, queue a row, deliver on drain when due |
-| recent past (≤ `maxDelay`) | Catch-up: deliver immediately, warn nothing |
+| recent past (≤ `maxDelay`) | Catch-up: same as `'now'` |
 | ancient past (> `maxDelay`) | Write `.eml`, mark `expired_at`, log warning, no delivery |
 
 `maxDelay` is overridable per-entity:
@@ -135,16 +149,19 @@ A persistent table (`mikser_post_email_queue` in `runtime/mikser.sqlite`) holds 
 ```sql
 mikser_post_email_queue (
     id          PRIMARY KEY → mikser_entities(id) ON DELETE CASCADE,
-    eml_path,
-    send_at, sent_at, expired_at,
-    attempts, last_error
+    eml_path,   eml_hash,   payload,
+    send_at,    next_attempt_at,
+    sent_at,    expired_at,
+    attempts,   last_error
 )
 ```
 
 - **PK on entity id + UPSERT** — re-editing `sendAt` reschedules in place; can't double-queue.
 - **FK CASCADE** — delete the source doc, queue row vanishes. Schedule follows the file.
-- **Drain triggers**: on startup, after every cycle (`onFinalized`), and every 60s in `--watch` mode.
-- **Failures stay queued**: `attempts` and `last_error` track retries; the next drain re-attempts.
+- **`payload` is what gets delivered** — the message as fields, stored on the row. Not the `.eml`: that is an audit artifact, and re-reading it to send a raw message depended both on the output tree still holding the file (a `--clear`, or a deploy `rsync --delete`, removes it) and on the transport honouring nodemailer's `raw` field. Mailgun's does not — `nodemailer-mailgun-transport` applies a key whitelist with no `raw` in it, so the field is dropped and what reaches the API has no sender, no recipient and no body. Released once the row is delivered.
+- **Drain triggers**: on startup; every 60s while resident (`--watch` **or** `--server`); after every cycle *only* when there is no timer, i.e. for a one-shot build.
+- **One drain at a time.** Passes are serialised. A pass only marks a row sent once the transport has answered, so an overlapping pass would select the same unmarked rows and deliver them twice — and a backlog easily outlasts the 60s interval.
+- **Failures back off**: `attempts` and `last_error` record what happened, and `next_attempt_at` holds the row until 1m × 2^attempts (capped at 15m). `send_at` is never moved — `maxDelay` is measured from it, so backing off must not make a row that keeps failing look permanently on-time and never expire.
 - **Retention**: delivered + expired rows are kept for `retention` (default `'90d'`) then pruned.
 
 ## Transport
@@ -233,6 +250,7 @@ Delete the entity's marker file, or bump `revision` to invalidate all of them.
 | `bcc` | spec | none | Global BCC, deduped with entity `bcc` |
 | `transport` | nodemailer config | JSON transport | Delivery target |
 | `maxDelay` | duration string | `'1h'` | How late past `sendAt` is still acceptable |
+| `sendTimeout` | duration string \| number | `'30s'` | How long one message may wait on the transport. `0` waits forever |
 | `retention` | duration string | `'90d'` | How long delivered/expired rows stay in the queue |
 | `sentFolder` | string | `'emails'` | Where send-once markers live; keep it gitignored and out of the deploy's delete set |
 | `revision` | number | `1` | Bump to invalidate every marker (forces a resend) |
@@ -242,8 +260,10 @@ Delete the entity's marker file, or bump `revision` to invalidate all of them.
 
 - **No transport-native scheduling.** Setting `send_at` on SendGrid/Mailchimp/etc. is not exposed — when an entity is rescheduled (frontmatter edited), the transport would hold both the old and new send. The internal queue dedupes via PK; transport-native scheduling can't.
 - **No rename-preserving queue.** A file rename = old entity DELETE + new entity INSERT; the old queue row cascades out, the new one's queue row inherits the renamed file's `sendAt`. Acceptable for v1.
-- **No throttling.** If 10k pending sends drain at once after long downtime, that's transport-side load to manage via SMTP-pool config.
-- **No retry policy beyond "next drain tries again".** `attempts` is recorded for visibility; there's no exponential backoff or dead-lettering.
+- **No throttling.** A drain delivers every due row, one at a time, with no rate cap. After long downtime that is transport-side load to manage via SMTP-pool config. Deliberately not capped per pass: a cap plus `maxDelay` is a way to *expire* mail that was only late because we throttled it, and a lost email is worse than a slow one.
+- **No dead-lettering.** A row that keeps failing backs off to a 15m retry and is eventually expired by `maxDelay`, with `last_error` on the row. There is no separate dead-letter table and no alert.
+- **A timeout cannot cancel a send.** It abandons the call, so a message that timed out may still have been delivered and the retry can duplicate it. The trade is deliberate: an unbounded send wedges the (serialised) drain permanently, which stops *all* delivery.
+- **One transport per process.** `transport` and the drain timer are module-level, so configuring `postEmail()` twice in one project has the second call's transport win for both. Use one.
 
 ## License
 
