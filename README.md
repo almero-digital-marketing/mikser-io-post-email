@@ -218,7 +218,9 @@ add it to `.gitignore` and to the deploy's exclude list.
 
 The delivery identity is a hash of `from`, `to`, `cc`, `bcc`, `subject`, the
 rendered body, and `sendAt` — not the composed `.eml` bytes, which carry a
-fresh `Message-ID` and `Date` on every compose and would never match.
+fresh `Message-ID` and `Date` on every compose and would never match. The same
+hash without the body is stored beside it, which is what lets a resend say
+whether the delivery changed or only its layout did.
 
 `sendAt` is part of it on purpose: a recurring email keeps its id and its body
 and only moves its send time, so without it every occurrence after the first
@@ -234,6 +236,31 @@ to: client@example.com
 subject: Your receipt
 deliveryKey: receipt-42
 ```
+
+**Editing an email layout re-sends everything that uses it.** The rendered
+body is part of the identity, so changing the layout changes it for every
+delivery at once — and each one is, by that rule, a new delivery. Four
+duplicate enquiries reached real people this way.
+
+When that happens the build says so before the mail goes out, naming the first
+one and counting the rest:
+
+```
+postEmail: /enquiries/2026-02-11-0942 was already delivered and is about to be
+sent AGAIN. Its recipients, subject and schedule are unchanged — only the
+rendered body moved, which is what an edited email layout does to every
+delivery that uses it. If that is not what you meant, set `deliveryKey` …
+```
+
+It is a warning rather than a refusal, because re-sending IS what you want for
+a newsletter whose body you just rewrote — and an email silently not sent is
+worse than one sent twice. For a submission that should go out once and never
+again, `deliveryKey` is the answer: give it the submission's own id and the
+body stops counting.
+
+A delivery whose recipients, subject or schedule moved is a genuinely
+different delivery and is not warned about, and neither is a `revision` bump —
+that is someone asking for the resend.
 
 ### Forcing a resend
 

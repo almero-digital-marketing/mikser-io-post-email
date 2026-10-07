@@ -16,6 +16,8 @@ import {
     resolveAddresses,
     decideTiming,
     deliveryHash,
+    bodylessDeliveryHash,
+    resendReason,
     markerName,
     formatMarker,
     isDelivered,
@@ -46,6 +48,9 @@ registerSchema('post_email', `
         id              TEXT PRIMARY KEY REFERENCES mikser_entities(id) ON DELETE CASCADE,
         eml_path        TEXT NOT NULL,
         eml_hash        TEXT,
+        -- The same identity with the body left out, so a resend can say
+        -- WHY it is happening — see resendReason in lib/pure.js.
+        body_hash       TEXT,
         -- The message as fields (JSON), which is how it is DELIVERED.
         --
         -- Not the .eml on disk: that is an audit artifact, and re-reading it
@@ -101,9 +106,21 @@ let draining = false
 
 // Build the .eml bytes nodemailer would have handed SMTP. Used both
 // for the on-disk audit file and (re-read) for queued deliveries.
-async function composeEml({ from, to, cc, bcc, subject, html }) {
-    const json = nodemailer.createTransport({ jsonTransport: true })
-    const built = await json.sendMail({ from, to, cc, bcc, subject, html })
+//
+// `streamTransport` with `buffer: true`, NOT `jsonTransport`. The json one
+// returns the ENVELOPE as a JSON string — `{"from":…,"to":…,"html":…}` — and
+// that is what has been written to `out/**/*.eml` under the name of an audit
+// artifact. A `.eml` is RFC 5322, so the files did not open in a mail client,
+// and the README calling it "the .eml audit file" said they would.
+//
+// It also broke the only other reader. `deliveryPayload` falls back to
+// `{ raw: <the file> }` for a row queued before payloads were stored, and
+// nodemailer's `raw` means raw MIME — so that path handed a transport a JSON
+// blob to send verbatim. Composing real MIME fixes the audit file and that
+// fallback in the same change.
+export async function composeEml({ from, to, cc, bcc, subject, html }) {
+    const stream = nodemailer.createTransport({ streamTransport: true, buffer: true })
+    const built = await stream.sendMail({ from, to, cc, bcc, subject, html })
     return built.message
 }
 
@@ -144,10 +161,21 @@ async function alreadySent(config, id, hash) {
     }
 }
 
-async function recordSent(config, id, hash) {
+async function recordSent(config, id, hash, bodylessHash) {
     const file = markerFile(config, id)
     await mkdir(path.dirname(file), { recursive: true })
-    await writeFile(file, formatMarker(config.revision ?? 1, hash))
+    await writeFile(file, formatMarker(config.revision ?? 1, hash, bodylessHash))
+}
+
+// The marker as it stands, for explaining a resend before it happens.
+async function readMarker(config, id) {
+    const file = markerFile(config, id)
+    if (!existsSync(file)) return null
+    try {
+        return await readFile(file, 'utf8')
+    } catch {
+        return null
+    }
 }
 
 // Record the marker AFTER the mail is already out, where a failure must
@@ -157,9 +185,9 @@ async function recordSent(config, id, hash) {
 // would guarantee one — the queue path would keep the row due and
 // re-deliver every drain, and the inline path would report a render
 // failure for mail that was actually delivered. So: warn, don't throw.
-async function recordSentSafely(config, id, hash, logger) {
+async function recordSentSafely(config, id, hash, bodylessHash, logger) {
     try {
-        await recordSent(config, id, hash)
+        await recordSent(config, id, hash, bodylessHash)
     } catch (err) {
         logger.warn(
             'postEmail: %s delivered but its send-once marker could not be written in %s — %s. ' +
@@ -168,23 +196,55 @@ async function recordSentSafely(config, id, hash, logger) {
     }
 }
 
+// Deliveries about to be sent again because their LAYOUT changed.
+//
+// Collected rather than logged one by one. A layout edit reaches every
+// delivery that uses it at once, and forty-seven copies of the same warning
+// is the shape a reader scrolls past — which is how the duplicates got out in
+// the first place. The first one carries the whole explanation, so it is
+// visible early enough to stop the build; the rest become a count.
+let bodyOnlyResends = []
+
+function warnBodyOnlyResend(id, logger) {
+    bodyOnlyResends.push(id)
+    if (bodyOnlyResends.length > 1) return
+    logger.warn(
+        'postEmail: %s was already delivered and is about to be sent AGAIN. Its recipients, subject ' +
+        'and schedule are unchanged — only the rendered body moved, which is what an edited email ' +
+        'layout does to every delivery that uses it. If that is not what you meant, set ' +
+        '`deliveryKey` in the entity (a submission id, an order number — anything stable) so the ' +
+        'identity stops depending on the body.',
+        id)
+}
+
+function reportBodyOnlyResends(logger) {
+    const resends = bodyOnlyResends
+    bodyOnlyResends = []
+    if (resends.length < 2) return
+    logger.warn(
+        'postEmail: %d deliveries are being re-sent because their body changed, not just %s. ' +
+        'An edited layout reaches all of them. See `deliveryKey`.',
+        resends.length, resends[0])
+}
+
 // ---------- queue ops ------------------------------------------------
 
-function upsertQueueRow({ id, emlPath, emlHash, sendAt, payload }) {
+function upsertQueueRow({ id, emlPath, emlHash, bodyHash, sendAt, payload }) {
     useDatabase().handle.prepare(`
-        INSERT INTO mikser_post_email_queue (id, eml_path, eml_hash, payload, send_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO mikser_post_email_queue (id, eml_path, eml_hash, body_hash, payload, send_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             send_at         = excluded.send_at,
             eml_path        = excluded.eml_path,
             eml_hash        = excluded.eml_hash,
+            body_hash       = excluded.body_hash,
             payload         = excluded.payload,
             sent_at         = NULL,
             expired_at      = NULL,
             next_attempt_at = NULL,
             attempts        = 0,
             last_error      = NULL
-    `).run(id, emlPath, emlHash, payload == null ? null : JSON.stringify(payload), sendAt)
+    `).run(id, emlPath, emlHash, bodyHash ?? null, payload == null ? null : JSON.stringify(payload), sendAt)
 }
 
 function recordExpiredInBand({ id, emlPath, sendAt, reason }) {
@@ -343,7 +403,7 @@ async function drainQueue({ config, logger }) {
                 // re-delivering the same message every drain (~every 60s
                 // in watch mode) until it expires.
                 markSent(row.id)
-                if (row.eml_hash) await recordSentSafely(config, row.id, row.eml_hash, logger)
+                if (row.eml_hash) await recordSentSafely(config, row.id, row.eml_hash, row.body_hash, logger)
             }
             logger.info('postEmail: delivered %s', row.id)
         } catch (err) {
@@ -388,11 +448,13 @@ export async function postprocess({ entity, options, config, logger }) {
     // bytes — those carry a fresh Message-ID/Date every compose).
     // sendAt is part of it, so a rescheduled occurrence of a recurring
     // email is a NEW delivery rather than a suppressed duplicate.
-    const hash = deliveryHash({
+    const identityFields = {
         from, to, cc, bcc, subject, html,
         sendAt: entity.meta?.sendAt,
         deliveryKey: entity.meta?.deliveryKey,
-    })
+    }
+    const hash = deliveryHash(identityFields)
+    const bodylessHash = bodylessDeliveryHash(identityFields)
 
     // Already delivered this exact content? Skip delivery — whatever the
     // timing. The .eml audit file above is still refreshed; only the send
@@ -401,6 +463,24 @@ export async function postprocess({ entity, options, config, logger }) {
     if (await alreadySent(config, entity.id, hash)) {
         logger.info('postEmail: %s already delivered, skipping', entity.id)
         return { success: true, result: entity.destination }
+    }
+
+    // About to send something that has been sent before. Say WHY, while
+    // there is still time to stop the build.
+    //
+    // An edited email layout gives every delivery that uses it a new body and
+    // therefore a new identity, and the guard — by its own rule, correctly —
+    // treats each one as new and sends it again. Reported: four duplicate
+    // enquiries to real people after a template edit, with nothing anywhere
+    // saying that was about to happen. `deliveryKey` already prevented it and
+    // was impossible to discover at the moment it mattered.
+    //
+    // Only the body-only shape is worth saying out loud. A delivery whose
+    // recipients or subject or schedule moved is a different delivery, and a
+    // revision bump is someone asking for exactly this.
+    if (resendReason(await readMarker(config, entity.id), config.revision ?? 1,
+        { hash, bodylessHash }) === 'body') {
+        warnBodyOnlyResend(entity.id, logger)
     }
 
     const maxDelayMs = parseDuration(entity.meta?.maxDelay ?? config.maxDelay, DEFAULT_MAX_DELAY_MS)
@@ -438,6 +518,7 @@ export async function postprocess({ entity, options, config, logger }) {
     // at onFinalized, so `mikser` still sends before it exits. A resident
     // instance drains on the timer, off the cycle, within DRAIN_INTERVAL_MS.
     upsertQueueRow({
+        bodyHash: bodylessHash,
         id: entity.id,
         emlPath: entity.destination,
         emlHash: hash,
@@ -471,7 +552,7 @@ export function postEmail(config = {}) {
         // leaves the table without the column, and the failure resurfaces
         // later as an opaque "no column named …" from an INSERT inside
         // postprocess, far from its cause.
-        for (const column of ['eml_hash TEXT', 'payload TEXT', 'next_attempt_at INTEGER']) {
+        for (const column of ['eml_hash TEXT', 'payload TEXT', 'next_attempt_at INTEGER', 'body_hash TEXT']) {
             try {
                 const db = useDatabase()
                 if (db?.isOpen) db.handle.exec(`ALTER TABLE mikser_post_email_queue ADD COLUMN ${column}`)
@@ -503,6 +584,12 @@ export function postEmail(config = {}) {
         }
 
         onFinalized(async () => {
+            // Before the early return below. Whether a timer owns delivery
+            // has nothing to do with whether this cycle queued a pile of
+            // re-sends, and under --watch (where a timer always exists) is
+            // exactly where a layout edit happens.
+            reportBodyOnlyResends(logger)
+
             // A one-shot build has no timer and exits after finalize, so the
             // queue MUST be drained here or its mail is never sent.
             //
