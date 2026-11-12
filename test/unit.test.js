@@ -9,6 +9,8 @@ import {
     decideTiming,
     deliveryHash, markerName, formatMarker, isDelivered, normalizeSendAt,
     sendWithTimeout, backoffDelay,
+    isPermanentFailure,
+    failureReason,
 } from '../lib/pure.js'
 
 describe('parseDuration', () => {
@@ -374,5 +376,64 @@ describe('backoffDelay', () => {
         assert.equal(backoffDelay({ attempts: null, ...opts }), 60_000)
         assert.equal(backoffDelay({ attempts: undefined, ...opts }), 60_000)
         assert.equal(backoffDelay({ attempts: -3, ...opts }), 60_000)
+    })
+})
+
+// ---------------------------------------------------------------------------
+// isPermanentFailure / failureReason
+//
+// The case these exist for: a spam run submitted malformed addresses, Mailgun
+// refused every receipt with 400, and the queue retried each one every 15
+// minutes for three weeks because a refusal and an outage were handled alike.
+describe('isPermanentFailure', () => {
+    it('treats an HTTP 4xx as permanent — the caller is wrong and will stay wrong', () => {
+        assert.equal(isPermanentFailure({ status: 400, message: 'Bad Request' }), true)
+        assert.equal(isPermanentFailure({ statusCode: 422 }), true)
+    })
+
+    it('treats an HTTP 5xx as retryable — the provider may recover', () => {
+        assert.equal(isPermanentFailure({ status: 502 }), false)
+        assert.equal(isPermanentFailure({ statusCode: 500 }), false)
+    })
+
+    it('keeps 408 and 429 retryable: they mean later, not never', () => {
+        assert.equal(isPermanentFailure({ status: 408 }), false)
+        assert.equal(isPermanentFailure({ status: 429 }), false)
+    })
+
+    it('INVERTS the rule for SMTP, where 4xx is explicitly temporary', () => {
+        assert.equal(isPermanentFailure({ responseCode: 450 }), false)
+        assert.equal(isPermanentFailure({ responseCode: 550 }), true)
+    })
+
+    it('prefers the SMTP code when both are present', () => {
+        // A 4xx reply code must not be read with the HTTP rule and retired.
+        assert.equal(isPermanentFailure({ responseCode: 451, status: 451 }), false)
+    })
+
+    it('retries anything it cannot classify — a lost letter costs more than a noisy log', () => {
+        assert.equal(isPermanentFailure({ message: 'socket hang up' }), false)
+        assert.equal(isPermanentFailure(new Error('ECONNRESET')), false)
+        assert.equal(isPermanentFailure(null), false)
+        assert.equal(isPermanentFailure(undefined), false)
+        assert.equal(isPermanentFailure('nope'), false)
+    })
+})
+
+describe('failureReason', () => {
+    it('adds the detail that says what was actually wrong', () => {
+        // Mailgun's message is only the reason phrase; `details` carries the cause.
+        assert.equal(
+            failureReason({ message: 'Bad Request', details: 'to parameter is not a valid address. please check documentation' }),
+            'Bad Request — to parameter is not a valid address. please check documentation')
+    })
+
+    it('does not repeat itself when the detail equals the message', () => {
+        assert.equal(failureReason({ message: 'Bad Request', details: 'Bad Request' }), 'Bad Request')
+    })
+
+    it('falls back to the message, and to something sayable when there is none', () => {
+        assert.equal(failureReason({ message: 'socket hang up' }), 'socket hang up')
+        assert.equal(failureReason(null), 'unknown error')
     })
 })

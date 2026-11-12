@@ -23,6 +23,8 @@ import {
     isDelivered,
     sendWithTimeout,
     backoffDelay,
+    isPermanentFailure,
+    failureReason,
 } from './lib/pure.js'
 
 // Re-export pure helpers so callers (and tests) can import them
@@ -407,9 +409,20 @@ async function drainQueue({ config, logger }) {
             }
             logger.info('postEmail: delivered %s', row.id)
         } catch (err) {
-            const delay = markFailed(row.id, err)
-            logger.error('postEmail: delivery failed for %s, retrying in %s — %s',
-                row.id, humanizeMs(delay), err.message || err)
+            const reason = failureReason(err)
+            // A REFUSED message is not a failed attempt. It cannot become
+            // deliverable, so retrying it is a loop with no exit — see
+            // isPermanentFailure for why 4xx and 5xx mean opposite things
+            // depending on the transport. Retire it the way an overdue row is
+            // retired, with the reason recorded, and say so once.
+            if (isPermanentFailure(err)) {
+                markExpired(row.id, reason)
+                logger.error('postEmail: %s refused, not retrying — %s', row.id, reason)
+            } else {
+                const delay = markFailed(row.id, err)
+                logger.error('postEmail: delivery failed for %s, retrying in %s — %s',
+                    row.id, humanizeMs(delay), reason)
+            }
         }
     }
 }
